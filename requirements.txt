@@ -1,0 +1,7 @@
+msal>=1.25.0
+pyodbc>=5.0.1
+pandas>=2.0.0
+openpyxl>=3.1.2
+configparser>=6.0.0
+argparse; python_version < "3.10"
+requests

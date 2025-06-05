@@ -1,0 +1,1064 @@
+"""
+Schema Exporter - A tool for exporting database schemas to CSV files for data governance
+
+This script extracts database schema information from SQL Server/Microsoft Fabric databases 
+and exports it to CSV files, maintaining versioning and history. It supports various
+authentication methods including service principal and interactive Azure AD authentication.
+"""
+
+import os
+import json
+import logging
+import sys
+import configparser
+import argparse
+import webbrowser
+from datetime import datetime
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Tuple, Any
+from pathlib import Path
+from contextlib import contextmanager
+
+# Third-party imports
+try:
+    import pyodbc
+    import pandas as pd
+    import msal
+except ImportError as e:
+    print(f"Error: Missing required packages. Please install dependencies. {e}")
+    print("Try: pip install pyodbc pandas msal")
+    sys.exit(1)
+
+# ========== CONSTANTS ==========
+
+ENCODING_UTF8_SIG = "utf-8-sig"
+KEY_COLS = ["TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME"]
+PRESERVED_COLS = [
+    "CONSTRAINT_TYPE", "FOREIGN_SCHEMA", "FOREIGN_TABLE", "FOREIGN_COLUMN",
+    "BUSINESS_MEANING", "BUSINESS_DOMAIN", "BUSINESS_OWNER_NAME", "IS_SENSITIVE",
+    "DATA_CLASSIFICATION", "RELATIONSHIP_NOTE", "SOURCE_NAME", "CREATED_BY"
+]
+SUBFOLDERS = ["001 Archive", "002 SQL Output", "003 User Input", "004 Lucidchart ERD Diagram", "005 DDL"]
+VERSION_FILE_NAME = "versions.json"
+DEFAULT_SENSITIVE_FLAG = 1 # Default value if not specified in config
+
+# SQL query - Consider moving to a separate .sql file for very large queries
+# Note: Parameter order matters and must match the order in `fetch_schema` params list.
+SQL_QUERY = """
+WITH user_input AS (
+    SELECT 
+        ? AS CREATED_BY,             -- Parameter 1
+        ? AS SOURCE_NAME,            -- Parameter 2
+        ? AS BUSINESS_DOMAIN,        -- Parameter 3
+        ? AS BUSINESS_OWNER_NAME,    -- Parameter 4
+        ? AS IS_SENSITIVE            -- Parameter 5
+)
+SELECT 
+    'sqlserver' AS dbms, 
+    t.TABLE_CATALOG, 
+    t.TABLE_SCHEMA, 
+    t.TABLE_NAME, 
+    c.COLUMN_NAME, 
+    c.ORDINAL_POSITION, 
+    c.DATA_TYPE,
+    c.CHARACTER_MAXIMUM_LENGTH, 
+    n.CONSTRAINT_TYPE,
+    k2.TABLE_SCHEMA AS FOREIGN_SCHEMA, 
+    k2.TABLE_NAME AS FOREIGN_TABLE, 
+    k2.COLUMN_NAME AS FOREIGN_COLUMN,
+    CAST(NULL AS VARCHAR(MAX)) AS BUSINESS_MEANING, -- Populated by merge/user input
+    ui.BUSINESS_DOMAIN,                              -- Populated from user_input CTE
+    ui.BUSINESS_OWNER_NAME,                          -- Populated from user_input CTE
+    ui.IS_SENSITIVE,                                 -- Populated from user_input CTE
+    CAST(NULL AS VARCHAR(100)) AS DATA_CLASSIFICATION, -- Populated by merge/user input
+    CAST(NULL AS VARCHAR(MAX)) AS RELATIONSHIP_NOTE,   -- Populated by merge/user input
+    ui.SOURCE_NAME,                                  -- Populated from user_input CTE
+    ui.CREATED_BY,                                   -- Populated from user_input CTE
+    GETDATE() AS CREATED_AT                          -- Capture timestamp
+FROM 
+    INFORMATION_SCHEMA.TABLES t
+LEFT JOIN 
+    INFORMATION_SCHEMA.COLUMNS c 
+    ON t.TABLE_CATALOG = c.TABLE_CATALOG 
+    AND t.TABLE_SCHEMA = c.TABLE_SCHEMA 
+    AND t.TABLE_NAME = c.TABLE_NAME
+LEFT JOIN ( -- Join to get constraints (Primary Key, Foreign Key, Unique)
+    INFORMATION_SCHEMA.KEY_COLUMN_USAGE k
+    JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS n 
+        ON k.CONSTRAINT_CATALOG = n.CONSTRAINT_CATALOG 
+        AND k.CONSTRAINT_SCHEMA = n.CONSTRAINT_SCHEMA 
+        AND k.CONSTRAINT_NAME = n.CONSTRAINT_NAME
+    LEFT JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS r -- Only populated for Foreign Keys
+        ON k.CONSTRAINT_CATALOG = r.CONSTRAINT_CATALOG 
+        AND k.CONSTRAINT_SCHEMA = r.CONSTRAINT_SCHEMA 
+        AND k.CONSTRAINT_NAME = r.CONSTRAINT_NAME
+) ON c.TABLE_CATALOG = k.TABLE_CATALOG 
+    AND c.TABLE_SCHEMA = k.TABLE_SCHEMA 
+    AND c.TABLE_NAME = k.TABLE_NAME 
+    AND c.COLUMN_NAME = k.COLUMN_NAME
+LEFT JOIN 
+    INFORMATION_SCHEMA.KEY_COLUMN_USAGE k2 -- Join again to get the referenced table/column for FKs
+    ON k.ORDINAL_POSITION = k2.ORDINAL_POSITION -- Matches columns in multi-column FKs
+    AND r.UNIQUE_CONSTRAINT_CATALOG = k2.CONSTRAINT_CATALOG -- Matches the referenced constraint
+    AND r.UNIQUE_CONSTRAINT_SCHEMA = k2.CONSTRAINT_SCHEMA
+    AND r.UNIQUE_CONSTRAINT_NAME = k2.CONSTRAINT_NAME
+CROSS JOIN 
+    user_input ui -- Apply default user_input values to all rows
+WHERE 
+    t.TABLE_TYPE = 'BASE TABLE'; -- Exclude VIEWS etc.
+"""
+
+# ========== DATA CLASSES FOR CONFIGURATION ==========
+
+@dataclass
+class DomainConfig:
+    """Configuration for a specific data domain."""
+    name: str
+    sql_server: str
+    sharepoint_path: Path # Use Path object directly
+    db_prefix: Optional[str] = None
+    db_override: List[str] = field(default_factory=list)
+
+@dataclass
+class AuthConfig:
+    """Database authentication configuration."""
+    method: str
+    username: Optional[str] = None
+    password: Optional[str] = None
+    client_id: Optional[str] = None
+    tenant_id: Optional[str] = None
+    client_secret: Optional[str] = None # Store securely if possible!
+
+@dataclass
+class UserInputConfig:
+    """Default user input values from configuration."""
+    created_by: str
+    source_name: str
+    business_domain: str
+    business_owner: str
+    is_sensitive: int
+
+# ========== LOGGING SETUP ==========
+
+def setup_logging(log_level=logging.INFO) -> logging.Logger:
+    """Configures logging to both file and console."""
+    log_formatter = logging.Formatter("%(asctime)s [%(levelname)-8s] %(name)-15s: %(message)s")
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / f"schema_extract_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+
+    # Clear existing handlers (if any, e.g., during interactive sessions)
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    # File handler
+    try:
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setFormatter(log_formatter)
+        root_logger.addHandler(file_handler)
+    except Exception as e:
+        print(f"Warning: Could not set up file logging to {log_file}: {e}")
+
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(log_formatter)
+    root_logger.addHandler(console_handler)
+
+    # Set higher level for noisy libraries
+    logging.getLogger("msal").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+
+    return logging.getLogger(__name__) # Return a logger specific to this module
+
+logger = setup_logging()
+
+# ========== AUTHENTICATION HELPERS ==========
+
+def get_service_principal_token(auth_cfg: AuthConfig) -> Optional[str]:
+    """Gets an Azure AD access token using service principal credentials."""
+    if not all([auth_cfg.client_id, auth_cfg.tenant_id, auth_cfg.client_secret]):
+        logger.error("Missing client_id, tenant_id, or client_secret for service principal auth.")
+        return None
+    try:
+        authority = f"https://login.microsoftonline.com/{auth_cfg.tenant_id}"
+        app = msal.ConfidentialClientApplication(
+            auth_cfg.client_id,
+            authority=authority,
+            client_credential=auth_cfg.client_secret
+        )
+        logger.debug(f"Attempting to acquire token via SP for client {auth_cfg.client_id}")
+        result = app.acquire_token_for_client(scopes=["https://database.windows.net/.default"])
+
+        if "access_token" in result:
+            logger.info("Successfully acquired token using service principal.")
+            return result["access_token"]
+        else:
+            error_desc = result.get('error_description', 'No error description provided.')
+            logger.error(f"Failed to acquire SP token: {result.get('error', 'Unknown Error')}. Details: {error_desc}")
+            return None
+    except Exception as e:
+        logger.exception(f"Exception during service principal authentication: {e}", exc_info=True)
+        return None
+
+def get_interactive_token(auth_cfg: AuthConfig) -> Optional[str]:
+    """Gets an Azure AD access token using interactive browser login."""
+    if not all([auth_cfg.client_id, auth_cfg.tenant_id]):
+        logger.error("Missing client_id or tenant_id for interactive auth.")
+        return None
+    try:
+        authority = f"https://login.microsoftonline.com/{auth_cfg.tenant_id}"
+        app = msal.PublicClientApplication(auth_cfg.client_id, authority=authority)
+        accounts = app.get_accounts(username=auth_cfg.username) # Optional username filter
+
+        if accounts:
+            logger.info(f"Attempting silent token acquisition for account: {accounts[0]['username']}")
+            result = app.acquire_token_silent(["https://database.windows.net/.default"], account=accounts[0])
+            if result and "access_token" in result:
+                logger.info("Successfully acquired token silently.")
+                return result["access_token"]
+            else:
+                 logger.info("Silent token acquisition failed or token expired.")
+
+        # Interactive flow
+        logger.info("Starting interactive browser authentication...")
+        # Consider adding login_hint=auth_cfg.username if helpful
+        result = app.acquire_token_interactive(scopes=["https://database.windows.net/.default"])
+
+        if "access_token" in result:
+            logger.info("Successfully acquired token interactively.")
+            return result["access_token"]
+        else:
+            error_desc = result.get('error_description', 'No error description provided.')
+            logger.error(f"Failed to acquire interactive token: {result.get('error', 'Unknown Error')}. Details: {error_desc}")
+            return None
+    except Exception as e:
+        logger.exception(f"Exception during interactive authentication: {e}", exc_info=True)
+        return None
+
+@contextmanager
+def db_connection(server: str, database: str, auth_cfg: AuthConfig) -> pyodbc.Connection:
+    """
+    Context manager that opens a pyodbc connection with the
+    authentication mode requested in auth_cfg.
+    """
+    base = (
+        "DRIVER={ODBC Driver 18 for SQL Server};"
+        f"SERVER={server};"
+        f"DATABASE={database};"
+        "Encrypt=yes;"
+        "TrustServerCertificate=no;"
+    )
+
+    conn: Optional[pyodbc.Connection] = None
+    logger.info(f"Attempting connection to {server}/{database} using '{auth_cfg.method}' auth.")
+
+    try:
+        # ──────────────────────────────────────────────────────────────
+        # 1) Service Principal (no MSAL – driver does the token dance)
+        # ──────────────────────────────────────────────────────────────
+        if auth_cfg.method == "service_principal":
+            if not all([auth_cfg.client_id, auth_cfg.tenant_id, auth_cfg.client_secret]):
+                raise ValueError("Service‑principal auth requires client_id, tenant_id, client_secret.")
+
+            conn_str = (
+                base +
+                "Authentication=ActiveDirectoryServicePrincipal;"
+                f"UID={auth_cfg.client_id};"
+                f"PWD={auth_cfg.client_secret};"
+                f"Authority Id={auth_cfg.tenant_id};"
+            )
+            conn = pyodbc.connect(conn_str, timeout=30)
+
+        # ──────────────────────────────────────────────────────────────
+        # 2) Interactive AAD (uses MSAL, falls back to browser pop‑up)
+        # ──────────────────────────────────────────────────────────────
+        elif auth_cfg.method == "interactive":
+            token = get_interactive_token(auth_cfg)
+            if not token:
+                raise ConnectionError("Failed to obtain interactive token.")
+
+            conn_str = base + "Authentication=ActiveDirectoryAccessToken;"
+            conn = pyodbc.connect(conn_str, attrs_before={1256: bytes(token, "utf-16-le")}, timeout=30)
+
+        # ──────────────────────────────────────────────────────────────
+        # 3) SQL Login
+        # ──────────────────────────────────────────────────────────────
+        elif auth_cfg.method == "sql":
+            if not all([auth_cfg.username, auth_cfg.password is not None]):
+                raise ValueError("SQL auth requires username and password.")
+
+            conn_str = base + f"UID={auth_cfg.username};PWD={auth_cfg.password};"
+            conn = pyodbc.connect(conn_str, timeout=30)
+
+        # ──────────────────────────────────────────────────────────────
+        # 4) Windows (Integrated)
+        # ──────────────────────────────────────────────────────────────
+        else:  # 'windows' or anything unrecognised
+            conn_str = base + "Trusted_Connection=yes;"
+            conn = pyodbc.connect(conn_str, timeout=30)
+
+        logger.info(f"Successfully connected to {server}/{database}.")
+        yield conn
+
+    except pyodbc.Error as e:
+        logger.error(f"pyodbc Error connecting to {server}/{database}: {e}")
+        raise ConnectionError(f"Database connection failed: {e}") from e
+
+    finally:
+        if conn:
+            try:
+                conn.close()
+                logger.debug(f"Closed connection to {server}/{database}.")
+            except pyodbc.Error as e:
+                logger.warning(f"Error closing connection to {server}/{database}: {e}")
+
+
+
+
+# ========== FILE AND FOLDER UTILITIES ==========
+
+def ensure_folders(base_path: Path) -> Dict[str, Path]:
+    """Creates required subfolder structure under the base path."""
+    paths = {}
+    logger.debug(f"Ensuring standard folders exist under: {base_path}")
+    try:
+        if not base_path.exists():
+             logger.warning(f"Base path {base_path} does not exist. Attempting to create.")
+             base_path.mkdir(parents=True, exist_ok=True) # Create base if needed
+
+        for name in SUBFOLDERS:
+            folder_path = base_path / name
+            folder_path.mkdir(exist_ok=True, parents=True)
+            paths[name] = folder_path
+            logger.debug(f"Ensured folder exists: {folder_path}")
+        return paths
+    except OSError as e:
+        logger.error(f"Failed to create required directories under {base_path}: {e}")
+        raise
+
+def _generate_versioned_filename(base_name: str, version: int) -> str:
+    """Generates a filename with a zero-padded version number."""
+    return f"{base_name}_v{str(version).zfill(2)}.csv"
+
+def archive_file(src_path: Path, archive_folder: Path) -> bool:
+    """Moves a file to the archive folder."""
+    if not src_path.exists():
+        logger.warning(f"Cannot archive - source file not found: {src_path}")
+        return False
+
+    archive_dest = archive_folder / src_path.name
+    logger.debug(f"Archiving {src_path.name} to {archive_folder}")
+    try:
+        archive_folder.mkdir(exist_ok=True, parents=True) # Ensure archive folder exists
+        src_path.rename(archive_dest)
+        logger.info(f"Archived: {src_path.name}")
+        return True
+    except OSError as e:
+        logger.error(f"Failed to archive {src_path.name}: {e}")
+        return False
+
+def cleanup_archives(archive_folder: Path, file_base_name: str, keep_count: int = 1):
+    """Removes old archived files, keeping only the specified number."""
+    if keep_count <= 0:
+        logger.warning("Archive cleanup keep_count is zero or negative. No archives will be kept.")
+        # Set keep_count to 0 if negative, so the logic below correctly deletes all matching files.
+        keep_count = 0
+
+    logger.debug(f"Cleaning up archives in {archive_folder} for base '{file_base_name}', keeping {keep_count}")
+    try:
+        # List files matching the pattern: base_name_vXX.csv
+        pattern = f"{file_base_name}_v*.csv"
+        # Sort numerically by version number (assuming _vXX format)
+        files = sorted(
+            [f for f in archive_folder.glob(pattern) if f.is_file()],
+            key=lambda x: int(x.stem.split('_v')[-1]) if '_v' in x.stem else -1 # Handle potential naming errors
+        )
+
+        files_to_delete = files[:-keep_count] if len(files) > keep_count else []
+
+        for outdated_file in files_to_delete:
+            try:
+                outdated_file.unlink()
+                logger.info(f"Deleted old archive: {outdated_file.name}")
+            except OSError as e:
+                logger.warning(f"Failed to delete old archive {outdated_file.name}: {e}")
+    except Exception as e:
+        logger.error(f"Error during archive cleanup for {file_base_name}: {e}")
+
+# ========== VERSIONING ==========
+
+def load_versions(version_file_path: Path) -> Dict[str, int]:
+    """Loads version information from the JSON version file."""
+    if not version_file_path.exists():
+        logger.info(f"Version file not found at {version_file_path}. Starting with empty version data.")
+        return {}
+    try:
+        with open(version_file_path, "r", encoding=ENCODING_UTF8_SIG) as f:
+            data = json.load(f)
+            if not isinstance(data, dict):
+                logger.warning(f"Invalid format in version file {version_file_path}. Expected a JSON object. Resetting versions.")
+                return {}
+            logger.info(f"Loaded version data for {len(data)} base filenames from {version_file_path.name}")
+            return data
+    except json.JSONDecodeError:
+        logger.warning(f"Invalid JSON in version file {version_file_path}. Resetting versions.")
+        return {}
+    except Exception as e:
+        logger.error(f"Error loading version file {version_file_path}: {e}")
+        return {} # Return empty dict on error to avoid breaking execution
+
+def save_versions(version_file_path: Path, data: Dict[str, int]):
+    """Saves version information to the JSON version file."""
+    logger.debug(f"Saving version data for {len(data)} base filenames to {version_file_path.name}")
+    try:
+        version_file_path.parent.mkdir(exist_ok=True) # Ensure directory exists
+        with open(version_file_path, "w", encoding=ENCODING_UTF8_SIG) as f:
+            json.dump(data, f, indent=2, sort_keys=True) # Sort keys for consistency
+        logger.info(f"Saved version data to {version_file_path.name}")
+    except Exception as e:
+        logger.error(f"Error saving version file {version_file_path}: {e}")
+        # Decide if this should raise an error or just log
+
+
+# ========== SCHEMA FETCHING AND PROCESSING ==========
+
+def fetch_schema(server: str, db: str, user_input_cfg: UserInputConfig, auth_cfg: AuthConfig) -> Optional[pd.DataFrame]:
+    """Fetches schema information for a given database using the predefined SQL query."""
+    params = [
+        user_input_cfg.created_by,
+        user_input_cfg.source_name,
+        user_input_cfg.business_domain,
+        user_input_cfg.business_owner,
+        user_input_cfg.is_sensitive,
+    ]
+    logger.info(f"Fetching schema for database: {db} on server: {server}")
+    try:
+        with db_connection(server, db, auth_cfg) as conn:
+            df = pd.read_sql(SQL_QUERY, conn, params=params)
+            logger.info(f"Successfully fetched {len(df)} schema rows for {db}.")
+            # Basic validation
+            if df.empty:
+                 logger.warning(f"Schema query returned no results for {db}.")
+            elif not all(col in df.columns for col in KEY_COLS):
+                 logger.error(f"Schema query result for {db} is missing key columns: {KEY_COLS}")
+                 return None # Critical error if key columns are missing
+            return df
+    except ConnectionError as e:
+        logger.error(f"Schema fetch failed for {db} due to connection error: {e}")
+        return None
+    except pd.errors.DatabaseError as e:
+        logger.error(f"Pandas SQL Error fetching schema for {db}: {e}")
+        return None
+    except Exception as e:
+        logger.exception(f"Unexpected error fetching schema for {db}: {e}", exc_info=True)
+        return None
+
+def merge_previous_metadata(current_df: pd.DataFrame, previous_file_path: Optional[Path]) -> pd.DataFrame:
+    """Merges current schema with previous version to preserve manually entered metadata."""
+    if not previous_file_path or not previous_file_path.exists():
+        logger.debug("No previous schema file found or specified for merging.")
+        # Ensure all preserved columns exist even if there's no merge
+        for col in PRESERVED_COLS:
+            if col not in current_df.columns:
+                current_df[col] = None # Add missing preserved columns with nulls
+        return current_df
+
+    logger.info(f"Attempting to merge metadata from previous version: {previous_file_path.name}")
+    try:
+        previous_df = pd.read_csv(previous_file_path, encoding=ENCODING_UTF8_SIG)
+
+        # Validate previous dataframe has necessary columns
+        required_merge_cols = KEY_COLS + PRESERVED_COLS
+        missing_cols = [col for col in required_merge_cols if col not in previous_df.columns]
+        if missing_cols:
+            logger.warning(f"Previous schema file {previous_file_path.name} is missing columns required for merge: {missing_cols}. Skipping merge for these columns.")
+            # Add missing columns to previous_df with nulls before merge attempt for safety
+            for col in missing_cols:
+                 if col in PRESERVED_COLS: # Only add missing *preserved* columns
+                    previous_df[col] = None
+
+        # Select only the key and preserved columns from the old data
+        previous_preserved = previous_df[KEY_COLS + [col for col in PRESERVED_COLS if col in previous_df.columns]].copy()
+
+        # Perform a left merge: keep all rows from current_df, add matching data from previous_preserved
+        merged_df = current_df.merge(
+            previous_preserved,
+            on=KEY_COLS,
+            how="left",
+            suffixes=('', '_prev') # Suffix for columns from the previous df
+        )
+
+        # Combine values: prioritize current non-null values, then previous non-null values
+        for col in PRESERVED_COLS:
+            prev_col = f"{col}_prev"
+            if prev_col in merged_df.columns:
+                # Use current value if not null, otherwise use previous value
+                merged_df[col] = merged_df[col].combine_first(merged_df[prev_col])
+                # Drop the temporary previous column
+                merged_df.drop(columns=[prev_col], inplace=True)
+            elif col not in merged_df.columns:
+                 # Ensure the column exists if it wasn't in current_df initially
+                 merged_df[col] = None
+
+
+        logger.info(f"Successfully merged metadata from {previous_file_path.name}.")
+        return merged_df
+
+    except pd.errors.EmptyDataError:
+        logger.warning(f"Previous schema file {previous_file_path.name} is empty. Cannot merge.")
+        return current_df # Return current df unmodified
+    except Exception as e:
+        logger.error(f"Error merging with previous schema {previous_file_path.name}: {e}")
+        return current_df # Return current df on error
+    
+def _latest_schema_file(sql_output_folder: Path, db_name: str) -> Optional[Path]:
+    """Return the most recently modified schema CSV for a given database across any date."""
+    pattern = f"*_{db_name}_v*.csv"
+    candidates = list(sql_output_folder.glob(pattern))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda f: f.stat().st_mtime)
+
+
+def export_schema_for_db(
+    domain_cfg: DomainConfig,
+    db_name: str,
+    paths: Dict[str, Path],
+    version_data: Dict[str, int],
+    user_input_cfg: UserInputConfig,
+    auth_cfg: AuthConfig
+) -> bool:
+    logger.info(f"--- Starting export process for database: {db_name} ---")
+
+    today_str = datetime.today().strftime("%Y-%m-%d")
+    file_base_name = f"{today_str}_{db_name}"
+
+    sql_output_folder = paths["002 SQL Output"]
+    archive_folder = paths["001 Archive"]
+    version_file_path = sql_output_folder / VERSION_FILE_NAME
+
+    latest_version = version_data.get(file_base_name, 0)
+    next_version = latest_version + 1
+    next_filename = _generate_versioned_filename(file_base_name, next_version)
+    next_filepath = sql_output_folder / next_filename
+
+    # 🔍 Use latest previous version across *any date*
+    previous_filepath = _latest_schema_file(sql_output_folder, db_name)
+
+    # 1. Fetch schema from DB
+    current_schema_df = fetch_schema(domain_cfg.sql_server, db_name, user_input_cfg, auth_cfg)
+    if current_schema_df is None:
+        logger.error(f"Schema fetch failed for {db_name}. Aborting export for this database.")
+        return False
+    if current_schema_df.empty:
+        logger.warning(f"Schema for {db_name} is empty. Proceeding to write empty file.")
+
+    # 2. Merge user-entered metadata (from previous file if available)
+    merged_df = merge_previous_metadata(current_schema_df, previous_filepath)
+
+    # 3. Check if schema hasn't changed at all – skip version bump
+    if previous_filepath and previous_filepath.exists():
+        try:
+            previous_df = pd.read_csv(previous_filepath, encoding=ENCODING_UTF8_SIG)
+            if merged_df.equals(previous_df):
+                logger.info(f"No schema changes detected for {db_name}. Skipping export.")
+                return True
+        except Exception as e:
+            logger.warning(f"Could not compare with previous schema file: {e}")
+
+    # 4. Archive the previous version if it exists
+    if previous_filepath and previous_filepath.exists():
+        if archive_file(previous_filepath, archive_folder):
+            cleanup_archives(archive_folder, file_base_name, keep_count=1)
+        else:
+            logger.warning(f"Failed to archive previous version {previous_filepath.name}. Proceeding anyway.")
+
+    # 5. Write new version
+    try:
+        logger.info(f"Exporting schema to: {next_filepath}")
+        merged_df.to_csv(next_filepath, index=False, encoding=ENCODING_UTF8_SIG)
+        logger.info(f"Successfully exported {next_filename}")
+
+        version_data[file_base_name] = next_version
+        save_versions(version_file_path, version_data)
+
+        logger.info(f"--- Finished export process for database: {db_name} ---")
+        return True
+
+    except Exception as e:
+        logger.exception(f"Failed to export schema {next_filename}: {e}")
+        if next_filepath.exists():
+            try:
+                next_filepath.unlink()
+                logger.warning(f"Removed potentially incomplete file: {next_filepath.name}")
+            except OSError:
+                logger.error(f"Could not remove incomplete file: {next_filepath.name}")
+        return False
+
+
+# ========== USER INPUT HANDLING ==========
+
+def check_user_input_for_updates(sql_output_folder: Path, user_input_folder: Path) -> List[Tuple[Path, Path]]:
+    """Checks the User Input folder for files meant to replace SQL Output files."""
+    updates_needed = []
+    logger.info(f"Checking for user updates in: {user_input_folder}")
+
+    if not user_input_folder.exists():
+        logger.warning(f"User input folder does not exist: {user_input_folder}")
+        return []
+
+    try:
+        # Iterate through CSV files in the user input folder
+        for user_file_path in user_input_folder.glob("*.csv"):
+            if not user_file_path.is_file():
+                continue
+
+            user_file_name = user_file_path.name
+            logger.debug(f"Checking user file: {user_file_name}")
+
+            # Basic check: Does the filename contain '_v' indicating a versioned file?
+            if '_v' not in user_file_name:
+                logger.warning(f"Skipping user file '{user_file_name}': Does not appear to be a versioned schema file (missing '_v').")
+                continue
+
+            try:
+                # Extract base name (e.g., YYYY-MM-DD_DBName)
+                base_name = user_file_name.split('_v')[0]
+                user_version = int(user_file_name.split('_v')[1].split('.')[0])
+            except (IndexError, ValueError):
+                 logger.warning(f"Skipping user file '{user_file_name}': Could not parse base name or version number.")
+                 continue
+
+
+            # Find the corresponding file(s) in the SQL Output folder
+            sql_output_pattern = f"{base_name}_v*.csv"
+            corresponding_sql_files = sorted(
+                 [f for f in sql_output_folder.glob(sql_output_pattern) if f.is_file()],
+                 key=lambda x: int(x.stem.split('_v')[-1]) if '_v' in x.stem else -1
+            )
+
+            if not corresponding_sql_files:
+                logger.warning(f"Found user file '{user_file_name}' but no matching base name found in SQL Output folder: {sql_output_folder}")
+                continue
+
+            latest_sql_file_path = corresponding_sql_files[-1]
+            latest_sql_version = int(latest_sql_file_path.stem.split('_v')[-1])
+
+
+            # Check if the user file represents a newer or same version to apply
+            # Allow applying same version if user file is more recently modified
+            if user_version >= latest_sql_version:
+                 # Check modification times for same version case
+                 if user_version == latest_sql_version:
+                     user_mtime = user_file_path.stat().st_mtime
+                     sql_mtime = latest_sql_file_path.stat().st_mtime
+                     if user_mtime <= sql_mtime:
+                         logger.debug(f"Skipping user file '{user_file_name}': Same version as SQL output and not newer.")
+                         continue # Skip if user file isn't newer
+
+                 # Add to list of updates
+                 updates_needed.append((user_file_path, latest_sql_file_path))
+                 logger.info(f"Found user update: '{user_file_name}' (v{user_version}) should replace/update '{latest_sql_file_path.name}' (v{latest_sql_version})")
+            else:
+                 logger.warning(f"Skipping user file '{user_file_name}' (v{user_version}): It is an older version than the latest SQL output '{latest_sql_file_path.name}' (v{latest_sql_version}).")
+
+
+    except Exception as e:
+        logger.exception(f"Error checking user input folder {user_input_folder}: {e}", exc_info=True)
+
+    logger.info(f"Found {len(updates_needed)} user updates to process.")
+    return updates_needed
+
+
+def process_user_updates(
+    updates: List[Tuple[Path, Path]],
+    version_data: Dict[str, int],
+    paths: Dict[str, Path]
+):
+    """Processes identified user updates by replacing SQL output files."""
+    if not updates:
+        logger.info("No user updates to process.")
+        return
+
+    sql_output_folder = paths["002 SQL Output"]
+    archive_folder = paths["001 Archive"]
+    version_file_path = sql_output_folder / VERSION_FILE_NAME
+
+    processed_count = 0
+    for user_file_path, sql_to_replace_path in updates:
+        user_file_name = user_file_path.name
+        sql_to_replace_name = sql_to_replace_path.name
+        logger.info(f"Processing user update: Applying '{user_file_name}' over '{sql_to_replace_name}'")
+
+        try:
+            # Extract base name and determine the version from the file being replaced
+            base_name = sql_to_replace_name.split('_v')[0]
+            current_sql_version = int(sql_to_replace_name.split('_v')[1].split('.')[0])
+            next_version = current_sql_version + 1 # Increment version number
+
+            # Archive the SQL file that is being replaced by user input
+            if not archive_file(sql_to_replace_path, archive_folder):
+                 logger.error(f"Failed to archive '{sql_to_replace_name}'. Skipping update for this file.")
+                 continue # Skip this update if archival fails
+
+            # Define the path for the new file (using the incremented version)
+            new_sql_output_filename = _generate_versioned_filename(base_name, next_version)
+            new_sql_output_path = sql_output_folder / new_sql_output_filename
+
+            # Copy the user's file content to the new versioned file in SQL Output
+            # We read/write to ensure consistent format and encoding
+            df_user = pd.read_csv(user_file_path, encoding=ENCODING_UTF8_SIG)
+            df_user.to_csv(new_sql_output_path, index=False, encoding=ENCODING_UTF8_SIG)
+            logger.info(f"Copied user data to new SQL Output file: {new_sql_output_filename}")
+
+            # Update the version data for this base name
+            version_data[base_name] = next_version
+            # Save versions immediately after successful update? Or batch at the end?
+            # Saving immediately is safer if script fails mid-way
+            save_versions(version_file_path, version_data)
+
+            # Remove the processed user input file
+            try:
+                user_file_path.unlink()
+                logger.info(f"Removed processed user file: {user_file_name}")
+            except OSError as e:
+                logger.warning(f"Could not remove processed user file {user_file_name}: {e}")
+
+            processed_count += 1
+
+        except Exception as e:
+            logger.exception(f"Failed to process user update from {user_file_name}: {e}", exc_info=True)
+
+    logger.info(f"Finished processing {processed_count} user updates.")
+
+
+...
+
+# ========== DOMAIN PROCESSING LOGIC ========== (patched for Fabric)
+
+def get_databases_for_domain(domain_cfg: DomainConfig, auth_cfg: AuthConfig) -> List[str]:
+    """Gets the list of database names to process for a domain."""
+    # 1. Use override list if provided
+    if domain_cfg.db_override:
+        logger.info(f"Using specific database list (override) for domain '{domain_cfg.name}': {', '.join(domain_cfg.db_override)}")
+        return domain_cfg.db_override
+
+    # # 2. Fabric SQL endpoints do not support querying 'master' database
+    # if 'fabric.microsoft.com' in domain_cfg.sql_server.lower():
+    #     logger.warning(f"Fabric endpoint detected. Skipping database discovery for domain '{domain_cfg.name}'. Use 'db_override' instead.")
+    #     return []
+
+    # 3. Query server if prefix is provided
+    if domain_cfg.db_prefix:
+        logger.info(f"Querying databases on server {domain_cfg.sql_server} with prefix '{domain_cfg.db_prefix}' for domain '{domain_cfg.name}'.")
+        databases = []
+        try:
+            with db_connection(domain_cfg.sql_server, "master", auth_cfg) as conn:
+                safe_prefix = domain_cfg.db_prefix.replace("'", "''")
+                query = f"SELECT name FROM sys.databases WHERE name LIKE '{safe_prefix}%' ORDER BY name"
+                cursor = conn.cursor()
+                cursor.execute(query)
+                databases = [row.name for row in cursor.fetchall()]
+
+                if not databases:
+                    logger.warning(f"No databases found on {domain_cfg.sql_server} with prefix '{domain_cfg.db_prefix}'.")
+                else:
+                    logger.info(f"Found {len(databases)} databases matching prefix for domain '{domain_cfg.name}': {', '.join(databases)}")
+                return databases
+        except ConnectionError as e:
+            logger.error(f"Failed to connect to {domain_cfg.sql_server}/master to get database list for domain '{domain_cfg.name}': {e}")
+            return []
+        except Exception as e:
+            logger.error(f"Failed to retrieve database list for prefix '{domain_cfg.db_prefix}' on {domain_cfg.sql_server}: {e}")
+            return []
+
+    # 4. No override and no prefix - return empty list
+    logger.warning(f"No 'db_override' list or 'db_prefix' specified for domain '{domain_cfg.name}'. Cannot determine databases to process.")
+    return []
+
+
+def process_domain(domain_cfg: DomainConfig, user_input_cfg: UserInputConfig, auth_cfg: AuthConfig):
+    """Processes schema extraction for all relevant databases within a domain."""
+    logger.info(f"===== Processing Domain: {domain_cfg.name} =====")
+    logger.info(f"SharePoint Path: {domain_cfg.sharepoint_path}")
+    logger.info(f"SQL Server: {domain_cfg.sql_server}")
+
+    # 1. Ensure base path and subfolders exist
+    try:
+        paths = ensure_folders(domain_cfg.sharepoint_path)
+    except Exception as e:
+        logger.error(f"Cannot proceed with domain '{domain_cfg.name}': Failed to prepare directories: {e}")
+        return # Stop processing this domain
+
+    sql_output_folder = paths["002 SQL Output"]
+    user_input_folder = paths["003 User Input"]
+    version_file_path = sql_output_folder / VERSION_FILE_NAME
+
+    # 2. Load existing version data for this domain
+    version_data = load_versions(version_file_path)
+
+    # 3. Get list of databases to process for this domain
+    databases_to_process = get_databases_for_domain(domain_cfg, auth_cfg)
+    if not databases_to_process:
+        logger.warning(f"No databases identified for domain '{domain_cfg.name}'. Skipping schema export for this domain.")
+        # Still check for user updates even if no DBs found matching prefix/override
+    else:
+        # 4. Process each database: Fetch schema, merge, archive, export
+        successful_exports = 0
+        failed_exports = 0
+        for db_name in databases_to_process:
+            try:
+                success = export_schema_for_db(
+                    domain_cfg, db_name, paths, version_data, user_input_cfg, auth_cfg
+                )
+                if success:
+                    successful_exports += 1
+                else:
+                    failed_exports += 1
+            except Exception as e:
+                 logger.exception(f"Unhandled exception during export for database {db_name}: {e}", exc_info=True)
+                 failed_exports +=1
+
+        logger.info(f"Domain '{domain_cfg.name}' database export summary: {successful_exports} succeeded, {failed_exports} failed.")
+        # Note: version_data is saved within export_schema_for_db after each successful export
+
+
+    # 5. Check for and process user input updates for this domain
+    # This runs *after* the automated exports for the day
+    user_updates = check_user_input_for_updates(sql_output_folder, user_input_folder)
+    if user_updates:
+         logger.info(f"Processing user updates found for domain '{domain_cfg.name}'.")
+         process_user_updates(user_updates, version_data, paths)
+         # Final save of versions after user updates are processed (if any)
+         save_versions(version_file_path, version_data)
+    else:
+         logger.info(f"No pending user updates found for domain '{domain_cfg.name}'.")
+
+
+    logger.info(f"===== Finished Processing Domain: {domain_cfg.name} =====")
+
+
+# ========== CONFIGURATION LOADING ==========
+
+def load_config(config_file='config.ini') -> Tuple[List[DomainConfig], UserInputConfig, AuthConfig]:
+    """Loads configuration from the INI file."""
+    config = configparser.ConfigParser(interpolation=None) # No interpolation needed
+    config_path = Path(config_file)
+
+    if not config_path.exists():
+        logger.error(f"Configuration file '{config_file}' not found.")
+        logger.info("Creating an example config file. Please edit it with your settings.")
+        _create_example_config(config_path)
+        sys.exit(1)
+
+    try:
+        logger.info(f"Loading configuration from: {config_file}")
+        config.read(config_path, encoding='utf-8') # Specify encoding
+
+        # --- Load Database Auth Config ---
+        if 'Database' not in config:
+            logger.error("Configuration error: Missing [Database] section.")
+            sys.exit(1)
+        db_sec = config['Database']
+        auth_method = db_sec.get('auth_method', 'windows').lower() # Default to windows
+        auth_cfg = AuthConfig(
+            method=auth_method,
+            username=db_sec.get('sql_username'), # Returns None if missing
+            password=db_sec.get('sql_password'), # Returns None if missing
+            client_id=db_sec.get('client_id'),   # Returns None if missing
+            tenant_id=db_sec.get('tenant_id'),   # Returns None if missing
+            client_secret=db_sec.get('client_secret') # Returns None if missing
+        )
+        # Validate required fields based on auth method
+        if auth_method == 'service_principal' and not all([auth_cfg.client_id, auth_cfg.tenant_id, auth_cfg.client_secret]):
+             logger.error("Config Error: Service Principal auth requires client_id, tenant_id, and client_secret in [Database] section.")
+             sys.exit(1)
+        if auth_method == 'interactive' and not all([auth_cfg.client_id, auth_cfg.tenant_id]):
+             logger.error("Config Error: Interactive auth requires client_id and tenant_id in [Database] section.")
+             sys.exit(1)
+        if auth_method == 'sql' and not all([auth_cfg.username, auth_cfg.password is not None]): # Check password exists
+             logger.error("Config Error: SQL auth requires sql_username and sql_password in [Database] section.")
+             sys.exit(1)
+
+
+        # --- Load User Input Config ---
+        if 'DEFAULT' not in config:
+             logger.error("Configuration error: Missing [DEFAULT] section for user input defaults.")
+             sys.exit(1)
+        def_sec = config['DEFAULT']
+        try:
+             sensitive_flag = def_sec.getint('is_sensitive', DEFAULT_SENSITIVE_FLAG)
+        except ValueError:
+             logger.warning(f"Invalid value for 'is_sensitive' in [DEFAULT]. Using default: {DEFAULT_SENSITIVE_FLAG}")
+             sensitive_flag = DEFAULT_SENSITIVE_FLAG
+
+        user_input_cfg = UserInputConfig(
+            created_by=def_sec.get('user', 'SchemaExporterScript'),
+            source_name=def_sec.get('source_name', 'Automated Extraction'),
+            business_domain=def_sec.get('business_domain', 'Unknown'),
+            business_owner=def_sec.get('business_owner', 'Unknown'),
+            is_sensitive=sensitive_flag
+        )
+
+
+        # --- Load Domain Configs ---
+        domains = []
+        for section in config.sections():
+            if section.startswith('Domain.'):
+                name = section.split('.', 1)[1]
+                domain_sec = config[section]
+
+                sql_server = domain_sec.get('sql_server')
+                sharepoint_path_str = domain_sec.get('sharepoint_path')
+
+                if not sql_server or not sharepoint_path_str:
+                     logger.error(f"Config Error: Domain '{name}' is missing required 'sql_server' or 'sharepoint_path'.")
+                     continue # Skip this invalid domain
+
+                db_override_str = domain_sec.get('db_override', '')
+                db_override = [db.strip() for db in db_override_str.split(',') if db.strip()]
+
+                domains.append(DomainConfig(
+                    name=name,
+                    sql_server=sql_server,
+                    sharepoint_path=Path(sharepoint_path_str), # Convert to Path object
+                    db_prefix=domain_sec.get('db_prefix'), # Returns None if missing
+                    db_override=db_override
+                ))
+
+        if not domains:
+            logger.error("No valid [Domain.*] sections found in the configuration file.")
+            sys.exit(1)
+
+        logger.info(f"Loaded {len(domains)} domain configurations.")
+        logger.info(f"Authentication method set to: {auth_cfg.method}")
+        logger.info(f"Default User Input - Created By: {user_input_cfg.created_by}, Source: {user_input_cfg.source_name}")
+
+        return domains, user_input_cfg, auth_cfg
+
+    except configparser.Error as e:
+        logger.error(f"Error parsing configuration file '{config_file}': {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.exception(f"Unexpected error loading configuration: {e}", exc_info=True)
+        sys.exit(1)
+
+def _create_example_config(config_path: Path):
+    """Creates a default/example config file."""
+    config = configparser.ConfigParser()
+
+    config['DEFAULT'] = {
+        '# Default values passed into the SQL query (used if not overridden by merged data)': '',
+        'user': 'SchemaExporterScript',
+        'source_name': 'Automated Extraction',
+        'business_domain': 'DefaultDomain',
+        'business_owner': 'DefaultOwner',
+        'is_sensitive': str(DEFAULT_SENSITIVE_FLAG) + '  # Default sensitivity flag (e.g., 1 or 0)'
+    }
+
+    config['Database'] = {
+        '# Authentication Method: windows, sql, service_principal, interactive': '',
+        'auth_method': 'windows',
+        '# Required for SQL auth:': '',
+        'sql_username': '',
+        'sql_password': '',
+        '# Required for service_principal and interactive Azure AD auth:': '',
+        'client_id': 'your_azure_ad_app_client_id',
+        'tenant_id': 'your_azure_ad_tenant_id',
+        '# Required for service_principal auth only (store securely!):': '',
+        'client_secret': ''
+    }
+
+    config['Domain.Example1'] = {
+        'sql_server': 'your_sql_server.database.windows.net',
+        'sharepoint_path': r'C:\path\to\your\sharepoint\sync\Example1', # Use raw string for Windows paths
+        '# Optional: Process databases starting with this prefix (ignored if db_override is set)': '',
+        'db_prefix': 'PREFIX_',
+        '# Optional: Process only these specific databases (comma-separated)': '',
+        'db_override': '' # e.g., DB1, DB2, AnotherDB
+    }
+
+    config['Domain.Example2_Override'] = {
+        'sql_server': 'another_server.example.com',
+        'sharepoint_path': '/path/to/sharepoint/sync/Example2', # Unix-style path
+        'db_prefix': 'IGNOREDPREFIX_', # Ignored because db_override is used
+        'db_override': 'SpecificDB1, SpecificDB2'
+    }
+
+    try:
+        with open(config_path, 'w', encoding='utf-8') as f:
+            f.write("# Configuration file for Schema Exporter\n")
+            f.write("# Please fill in your specific details.\n\n")
+            config.write(f)
+        logger.info(f"Example configuration file created at: {config_path}")
+    except OSError as e:
+        logger.error(f"Failed to create example configuration file at {config_path}: {e}")
+
+
+# ========== MAIN EXECUTION ==========
+
+def main():
+    """Main function to parse arguments, load config, and process domains."""
+    parser = argparse.ArgumentParser(description="Schema Exporter for SQL Server/Fabric databases")
+    parser.add_argument(
+        '--config',
+        default='config.ini',
+        help='Path to the configuration INI file (default: config.ini)'
+    )
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Enable verbose (DEBUG level) logging'
+    )
+    args = parser.parse_args()
+
+    # Adjust log level if verbose flag is set
+    if args.verbose:
+        logger.setLevel(logging.DEBUG)
+        for handler in logger.handlers:
+             handler.setLevel(logging.DEBUG) # Ensure handlers also use DEBUG level
+        logger.info("Verbose logging enabled.")
+
+
+    start_time = datetime.now()
+    logger.info("=================================================")
+    logger.info(f"Schema Exporter Started at {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"Using configuration file: {args.config}")
+    logger.info("=================================================")
+
+
+    try:
+        # Load configuration
+        domains, user_input_cfg, auth_cfg = load_config(args.config)
+
+        # Process each configured domain
+        total_domains = len(domains)
+        for i, domain_cfg in enumerate(domains, 1):
+             logger.info(f"--- Processing Domain {i}/{total_domains}: {domain_cfg.name} ---")
+             process_domain(domain_cfg, user_input_cfg, auth_cfg)
+
+        end_time = datetime.now()
+        duration = end_time - start_time
+        logger.info("=================================================")
+        logger.info(f"Schema Exporter Finished at {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Total execution time: {duration}")
+        logger.info("=================================================")
+        logger.info("✅ All configured domains processed.")
+
+    except SystemExit:
+         # Raised by sys.exit(1) on config errors, allows clean exit
+         logger.error("Exiting due to configuration errors.")
+    except Exception as e:
+        logger.exception(f"An unexpected critical error occurred: {e}", exc_info=True)
+        sys.exit(1) # Exit with error code
+
+if __name__ == "__main__":
+    # Recommended: Create a requirements.txt file with:
+    # pandas
+    # pyodbc
+    # msal
+    main()
