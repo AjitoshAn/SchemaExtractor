@@ -66,6 +66,18 @@ except ImportError as e:
 
 ENCODING_UTF8_SIG = "utf-8-sig"
 KEY_COLS = ["TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME"]
+# Columns to remove from final output CSV files
+OUTPUT_DROP_COLS = [
+    "BUSINESS_MEANING",
+    "BUSINESS_DOMAIN",
+    "BUSINESS_OWNER_NAME",
+    "IS_SENSITIVE",
+    "DATA_CLASSIFICATION",
+    "RELATIONSHIP_NOTE",
+    "SOURCE_NAME",
+    "CREATED_BY",
+    "CREATED_AT",
+]
 # Keep only columns that might contain manual data to be truly preserved across runs
 PRESERVED_COLS = [
     "CONSTRAINT_TYPE",
@@ -922,12 +934,16 @@ def export_schema_for_db(
     # 2. Merge metadata
     merged_df = merge_previous_metadata(current_schema_df, previous_filepath)
 
+    # Drop columns that should not appear in final output
+    merged_df.drop(columns=[c for c in OUTPUT_DROP_COLS if c in merged_df.columns], inplace=True)
+
     # 3. Check for changes
     if previous_filepath and previous_filepath.exists():
         try:
             previous_df = pd.read_csv(
                 previous_filepath, encoding=ENCODING_UTF8_SIG, dtype=str
             )
+            previous_df.drop(columns=[c for c in OUTPUT_DROP_COLS if c in previous_df.columns], inplace=True)
             # Ensure key columns are strings for comparison
             for col in KEY_COLS:
                 if col in merged_df.columns:
@@ -1119,6 +1135,9 @@ def process_user_updates(
                 failed_count += 1
                 continue
             # --- End Validation ---
+
+            # Remove columns not wanted in final output
+            df_user.drop(columns=[c for c in OUTPUT_DROP_COLS if c in df_user.columns], inplace=True)
 
             # Determine version number for new file
             current_version = version_data.get(version_base_key, 0)
